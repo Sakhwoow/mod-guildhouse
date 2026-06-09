@@ -5,6 +5,7 @@
 #include "Guild.h"
 #include "SpellAuraEffects.h"
 #include "Chat.h"
+#include "CommandScript.h"
 #include "ScriptedCreature.h"
 #include "ScriptedGossip.h"
 #include "GuildMgr.h"
@@ -15,6 +16,9 @@
 #include "Transport.h"
 #include "Maps/MapMgr.h"
 #include "guildhouse.h"
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 class GuildData : public DataMap::Base
 {
@@ -617,7 +621,11 @@ public:
         static ChatCommandTable GuildHouseCommandTable =
         {
             {"teleport", HandleGuildHouseTeleCommand, SEC_PLAYER, Console::Yes},
-            {"butler", HandleSpawnButlerCommand, SEC_PLAYER, Console::Yes},
+            {"tele",     HandleGuildHouseTeleCommand, SEC_PLAYER, Console::Yes},
+            {"butler",   HandleSpawnButlerCommand,    SEC_PLAYER, Console::No },
+            {"status",   HandleGuildHouseStatusCommand, SEC_PLAYER, Console::No},
+            {"sell",     HandleGuildHouseSellCommand,   SEC_PLAYER, Console::No},
+            {"buy",      HandleGuildHouseBuyCommand,    SEC_PLAYER, Console::No},
         };
 
         static ChatCommandTable GuildHouseCommandBaseTable =
@@ -632,6 +640,324 @@ public:
     static uint32 GetGuildPhase(Player* player)
     {
         return player->GetGuildId() + 10;
+    }
+
+    // --- helpers -------------------------------------------------------
+
+    static bool GHCheckGuild(ChatHandler* handler, Player* player)
+    {
+        if (!player->GetGuild())
+        {
+            handler->SendSysMessage("Вы не состоите в гильдии.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        return true;
+    }
+
+    static bool GHCheckHasHouse(ChatHandler* handler, Player* player)
+    {
+        QueryResult result = CharacterDatabase.Query("SELECT 1 FROM guild_house WHERE guild={}", player->GetGuildId());
+        if (!result)
+        {
+            handler->SendSysMessage("У вашей гильдии нет Дома Гильдии. Купите через /gh buy house.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        return true;
+    }
+
+    static bool GHCheckInHouse(ChatHandler* handler, Player* player)
+    {
+        if (player->GetAreaId() != 876)
+        {
+            handler->SendSysMessage("Вы должны находиться в Доме Гильдии. Телепортируйтесь через /gh tele.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        return true;
+    }
+
+    static bool GHCheckBuyRank(ChatHandler* handler, Player* player)
+    {
+        Guild* guild = sGuildMgr->GetGuildById(player->GetGuildId());
+        Guild::Member const* memberMe = guild->GetMember(player->GetGUID());
+        int32 requiredRank = sConfigMgr->GetOption<int32>("GuildHouseBuyRank", 4);
+        if (!memberMe->IsRankNotLower(requiredRank))
+        {
+            handler->SendSysMessage("У вас нет прав для покупки улучшений Дома Гильдии.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        return true;
+    }
+
+    static void GHSpawnNPC(ChatHandler* handler, Player* player, uint32 entry, int32 cost)
+    {
+        if (player->FindNearestCreature(entry, VISIBILITY_RANGE, true))
+        {
+            handler->SendSysMessage("Этот NPC уже есть в Доме Гильдии.");
+            return;
+        }
+
+        QueryResult result = WorldDatabase.Query("SELECT posX, posY, posZ, orientation FROM guild_house_spawns WHERE entry={}", entry);
+        if (!result)
+        {
+            handler->PSendSysMessage("Нет данных о позиции для entry {}.", entry);
+            return;
+        }
+
+        Field* fields = result->Fetch();
+        float posX = fields[0].Get<float>(), posY = fields[1].Get<float>();
+        float posZ = fields[2].Get<float>(), ori  = fields[3].Get<float>();
+
+        Creature* creature = new Creature();
+        if (!creature->Create(player->GetMap()->GenerateLowGuid<HighGuid::Unit>(), player->GetMap(), GetGuildPhase(player), entry, 0, posX, posY, posZ, ori))
+        {
+            delete creature;
+            return;
+        }
+        creature->SaveToDB(player->GetMapId(), (1 << player->GetMap()->GetSpawnMode()), GetGuildPhase(player));
+        uint32 db_guid = creature->GetSpawnId();
+        creature->CleanupsBeforeDelete();
+        delete creature;
+        creature = new Creature();
+        if (!creature->LoadCreatureFromDB(db_guid, player->GetMap()))
+        {
+            delete creature;
+            return;
+        }
+        sObjectMgr->AddCreatureToGrid(db_guid, sObjectMgr->GetCreatureData(db_guid));
+        player->ModifyMoney(-cost);
+    }
+
+    static void GHSpawnObject(ChatHandler* handler, Player* player, uint32 entry, int32 cost)
+    {
+        if (player->FindNearestGameObject(entry, VISIBLE_RANGE))
+        {
+            handler->SendSysMessage("Этот объект уже есть в Доме Гильдии.");
+            return;
+        }
+
+        QueryResult result = WorldDatabase.Query("SELECT posX, posY, posZ, orientation FROM guild_house_spawns WHERE entry={}", entry);
+        if (!result)
+        {
+            handler->PSendSysMessage("Нет данных о позиции для entry {}.", entry);
+            return;
+        }
+
+        Field* fields = result->Fetch();
+        float posX = fields[0].Get<float>(), posY = fields[1].Get<float>();
+        float posZ = fields[2].Get<float>(), ori  = fields[3].Get<float>();
+
+        GameObjectTemplate const* goInfo = sObjectMgr->GetGameObjectTemplate(entry);
+        if (!goInfo || (goInfo->displayId && !sGameObjectDisplayInfoStore.LookupEntry(goInfo->displayId)))
+            return;
+
+        GameObject* object = sObjectMgr->IsGameObjectStaticTransport(goInfo->entry) ? new StaticTransport() : new GameObject();
+        ObjectGuid::LowType guidLow = player->GetMap()->GenerateLowGuid<HighGuid::GameObject>();
+        if (!object->Create(guidLow, goInfo->entry, player->GetMap(), GetGuildPhase(player), posX, posY, posZ, ori, G3D::Quat(), 0, GO_STATE_READY))
+        {
+            delete object;
+            return;
+        }
+        object->SaveToDB(player->GetMapId(), (1 << player->GetMap()->GetSpawnMode()), GetGuildPhase(player));
+        guidLow = object->GetSpawnId();
+        delete object;
+        object = sObjectMgr->IsGameObjectStaticTransport(goInfo->entry) ? new StaticTransport() : new GameObject();
+        if (!object->LoadGameObjectFromDB(guidLow, player->GetMap(), true))
+        {
+            delete object;
+            return;
+        }
+        sObjectMgr->AddGameobjectToGrid(guidLow, sObjectMgr->GetGameObjectData(guidLow));
+        player->ModifyMoney(-cost);
+    }
+
+    // --- command handlers ----------------------------------------------
+
+    static bool HandleGuildHouseStatusCommand(ChatHandler* handler)
+    {
+        Player* player = handler->GetSession()->GetPlayer();
+        if (!GHCheckGuild(handler, player))
+            return true; // already sent message, return true to avoid "unknown subcommand"
+        QueryResult result = CharacterDatabase.Query("SELECT 1 FROM guild_house WHERE guild={}", player->GetGuildId());
+        if (result)
+            handler->SendSysMessage("[Дом Гильдии] |cff00ff00Куплен|r — /gh tele для телепорта, /gh buy <улучшение> для улучшений.");
+        else
+            handler->SendSysMessage("[Дом Гильдии] |cffff4444Не куплен|r — купите за 1000з через /gh buy house.");
+        return true;
+    }
+
+    static bool HandleGuildHouseSellCommand(ChatHandler* handler)
+    {
+        Player* player = handler->GetSession()->GetPlayer();
+        if (!GHCheckGuild(handler, player))
+            return false;
+        if (player->GetGuild()->GetLeaderGUID() != player->GetGUID())
+        {
+            handler->SendSysMessage("Только Гильдмастер может продать Дом Гильдии.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        if (!GHCheckHasHouse(handler, player))
+            return false;
+
+        uint32 guildPhase = GetGuildPhase(player);
+        Map* map = sMapMgr->FindMap(1, 0);
+
+        QueryResult creatureResult = WorldDatabase.Query("SELECT guid FROM creature WHERE map=1 AND phaseMask={}", guildPhase);
+        if (creatureResult)
+        {
+            do
+            {
+                uint32 lowguid = creatureResult->Fetch()[0].Get<uint32>();
+                if (CreatureData const* cr_data = sObjectMgr->GetCreatureData(lowguid))
+                    if (Creature* creature = map->GetCreature(ObjectGuid::Create<HighGuid::Unit>(cr_data->id1, lowguid)))
+                    {
+                        creature->CombatStop();
+                        creature->DeleteFromDB();
+                        creature->AddObjectToRemoveList();
+                    }
+            } while (creatureResult->NextRow());
+        }
+
+        QueryResult goResult = WorldDatabase.Query("SELECT guid FROM gameobject WHERE map=1 AND phaseMask={}", guildPhase);
+        if (goResult)
+        {
+            do
+            {
+                uint32 lowguid = goResult->Fetch()[0].Get<uint32>();
+                if (GameObjectData const* go_data = sObjectMgr->GetGameObjectData(lowguid))
+                    if (GameObject* gobject = map->GetGameObject(ObjectGuid::Create<HighGuid::GameObject>(go_data->id, lowguid)))
+                    {
+                        gobject->SetRespawnTime(0);
+                        gobject->Delete();
+                        gobject->DeleteFromDB();
+                        gobject->CleanupsBeforeDelete();
+                    }
+            } while (goResult->NextRow());
+        }
+
+        CharacterDatabase.Execute("DELETE FROM guild_house WHERE guild={}", player->GetGuildId());
+        int32 refund = sConfigMgr->GetOption<int32>("CostGuildHouse", 10000000) / 2;
+        player->ModifyMoney(refund);
+        player->GetGuild()->BroadcastToGuild(player->GetSession(), false, "Наш Дом Гильдии был продан.", LANG_UNIVERSAL);
+        handler->PSendSysMessage("[Дом Гильдии] Продан. Возврат: {}з.", refund / 10000);
+        return true;
+    }
+
+    static bool HandleGuildHouseBuyCommand(ChatHandler* handler, Tail keyTail)
+    {
+        Player* player = handler->GetSession()->GetPlayer();
+        if (!player || !GHCheckGuild(handler, player))
+            return false;
+
+        std::string key = std::string(keyTail);
+
+        // --- Покупка самого дома (не требует быть в доме) ---
+        if (key == "house")
+        {
+            if (player->GetGuild()->GetLeaderGUID() != player->GetGUID())
+            {
+                handler->SendSysMessage("Только Гильдмастер может купить Дом Гильдии.");
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+            QueryResult existing = CharacterDatabase.Query("SELECT 1 FROM guild_house WHERE guild={}", player->GetGuildId());
+            if (existing)
+            {
+                handler->SendSysMessage("У вашей гильдии уже есть Дом Гильдии.");
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+            int32 houseCost = sConfigMgr->GetOption<int32>("CostGuildHouse", 10000000);
+            if ((int64)player->GetMoney() < houseCost)
+            {
+                handler->PSendSysMessage("Недостаточно золота. Нужно: {}з.", houseCost / 10000);
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+            float posX = 16222.972f, posY = 16267.802f, posZ = 13.136777f, ori = 1.461173f;
+            uint32 guildPhase = player->GetGuildId() + 10;
+            CharacterDatabase.Execute("INSERT INTO guild_house (guild, phase, map, positionX, positionY, positionZ, orientation) VALUES ({}, {}, {}, {}, {}, {}, {})",
+                player->GetGuildId(), guildPhase, 1u, posX, posY, posZ, ori);
+            player->ModifyMoney(-houseCost);
+            player->GetGuild()->BroadcastToGuild(player->GetSession(), false,
+                "У нашей гильдии теперь есть Дом Гильдии! Введите /gh tele для телепорта.", LANG_UNIVERSAL);
+            handler->SendSysMessage("[Дом Гильдии] |cff00ff00Куплен!|r Введите /gh tele чтобы попасть туда.");
+            return true;
+        }
+
+        // --- Улучшения — нужно быть в доме ---
+        if (!GHCheckHasHouse(handler, player) || !GHCheckInHouse(handler, player) || !GHCheckBuyRank(handler, player))
+            return false;
+
+        struct AmenityDef {
+            bool isObject;
+            std::vector<uint32> entries;
+            std::string configKey;
+            int32 defaultCost;
+        };
+
+        bool isAlliance = player->GetTeamId() == TEAM_ALLIANCE;
+        std::unordered_map<std::string, AmenityDef> am;
+        am["mailbox"]     = {true,  {184137},                                  "GuildHouseMailbox",     500000};
+        am["bank"]        = {false, {30605},                                   "GuildHouseBank",       1000000};
+        am["auctioneer"]  = {false, {isAlliance ? 8719u : 9856u},              "GuildHouseAuctioneer",  500000};
+        am["innkeeper"]   = {false, {GetCreatureEntry(2)},                     "GuildHouseInnKeeper",  1000000};
+        am["spirit"]      = {false, {6491},                                    "GuildHouseSpirit",      100000};
+        am["vendor"]      = {false, {28692, 19572, 29636, 29493},              "GuildHouseVendor",      500000};
+        am["trainer"]     = {false, {29195, 26324, 26325, 26326, 26327,
+                                     26328, 26329, 26330, 26331, 26332},       "GuildHouseTrainerCost",1000000};
+        {
+            std::vector<uint32> profEntries = {19052, 2836, 8736, 2627, 19187, 19180, 8128, 908, 19185, 2834, 19184};
+            if (isAlliance) { profEntries.push_back(18773); profEntries.push_back(18774); profEntries.push_back(30721); }
+            else            { profEntries.push_back(18753); profEntries.push_back(18751); profEntries.push_back(30722); }
+            am["prof"] = {false, profEntries, "GuildHouseProf", 500000};
+        }
+        am["portal_sw"]  = {true, {GetGameObjectEntry(0)}, "GuildHousePortal", 500000};
+        am["portal_if"]  = {true, {GetGameObjectEntry(3)}, "GuildHousePortal", 500000};
+        am["portal_da"]  = {true, {GetGameObjectEntry(1)}, "GuildHousePortal", 500000};
+        am["portal_ex"]  = {true, {GetGameObjectEntry(2)}, "GuildHousePortal", 500000};
+        am["portal_og"]  = {true, {GetGameObjectEntry(4)}, "GuildHousePortal", 500000};
+        am["portal_tb"]  = {true, {GetGameObjectEntry(6)}, "GuildHousePortal", 500000};
+        am["portal_uc"]  = {true, {GetGameObjectEntry(7)}, "GuildHousePortal", 500000};
+        am["portal_sm"]  = {true, {GetGameObjectEntry(5)}, "GuildHousePortal", 500000};
+        am["portal_sh"]  = {true, {GetGameObjectEntry(8)}, "GuildHousePortal", 500000};
+        am["portal_dl"]  = {true, {GetGameObjectEntry(9)}, "GuildHousePortal", 500000};
+
+        auto it = am.find(key);
+        if (it == am.end())
+        {
+            handler->PSendSysMessage("Неизвестный тип улучшения: '{}'. Доступные: mailbox, bank, auctioneer, innkeeper, spirit, vendor, trainer, prof, portal_sw/if/da/ex/og/tb/uc/sm/sh/dl.", key);
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        auto const& def = it->second;
+        int32 unitCost = sConfigMgr->GetOption<int32>(def.configKey, def.defaultCost);
+        int32 totalCost = unitCost * (int32)def.entries.size();
+
+        if ((int64)player->GetMoney() < totalCost)
+        {
+            handler->PSendSysMessage("Недостаточно золота. Нужно: {}з.", totalCost / 10000);
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        uint32 spawned = 0;
+        for (uint32 entry : def.entries)
+        {
+            if (def.isObject)
+                GHSpawnObject(handler, player, entry, 0);
+            else
+                GHSpawnNPC(handler, player, entry, 0);
+            spawned++;
+        }
+        player->ModifyMoney(-totalCost);
+        handler->PSendSysMessage("[Дом Гильдии] Куплено ({} шт.). Списано: {}з.", spawned, totalCost / 10000);
+        return true;
     }
 
     static bool HandleSpawnButlerCommand(ChatHandler* handler)
